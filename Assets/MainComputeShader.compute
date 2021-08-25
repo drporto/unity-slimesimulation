@@ -1,0 +1,168 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel agentsSensorKernel
+#pragma kernel agentsMoveKernel
+#pragma kernel screenUpdateKernel
+#pragma kernel screenClearKernel
+
+#define TWOPI 6.283185307
+#define PI 3.141592654
+#define HALFPI 1.570796327
+
+RWTexture2D<float4> screen;
+uniform int screenWidth;
+uniform int screenHeight;
+
+uniform int numAgents;
+uniform float evaporateSpeed;
+uniform int blurOffset;
+uniform float diffuseSpeed;
+
+uniform float time;
+uniform float deltaTime;
+
+struct Agent {
+    float2 pos;
+    float angle;
+    float speed;
+    float turnSpeed;
+    float sensorSize;
+    float sensorAngOffset;
+    float sensorDstOffset;
+    float depositRate;
+    float4 speciesMask;
+};
+RWStructuredBuffer<Agent> agents;
+
+uint hash(uint state){
+    state ^= 2747636419u;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    state ^= state >> 16;
+    state *= 2654435769u;
+    return state;
+}
+
+float floatConstruct( uint m ) {
+    const uint ieeeMantissa = 0x007FFFFFu;  // binary32 mantissa bitmask
+    const uint ieeeOne      = 0x3F800000u;  // 1.0 in IEEE binary32
+    m &= ieeeMantissa;                      // Keep only mantissa bits (fractional part)
+    m |= ieeeOne;                           // Add fractional part to 1.0
+    float  f = asfloat(m);                  // Range [1:2]
+    return f - 1.0;                         // Range [0:1]
+}
+
+float random_hash(uint state){
+    return floatConstruct(hash(state));
+}
+
+float nrand(float2 uv)
+{
+    return frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+float nrand(float u, float v)
+{
+    return frac(sin(dot(float2(u, v), float2(12.9898, 78.233))) * 43758.5453);
+}
+
+/*
+lookup is only used to change the diraction of the sesne function
+can be: 0.0f, -1.0f, 1.0f
+*/
+float sense(Agent agent, float lookup){
+    float sensorAngle = agent.angle + lookup * agent.sensorAngOffset;
+    float2 sensorDir = float2(cos(sensorAngle), sin(sensorAngle));
+    int2 sensorCentre = agent.pos + sensorDir * agent.sensorDstOffset;
+    
+    float sum = 0;
+    for(int offsetx = -agent.sensorSize; offsetx <= agent.sensorSize; offsetx++){
+        for(int offsety = -agent.sensorSize; offsety <= agent.sensorSize; offsety++){
+            int2 pos = sensorCentre + int2(offsetx,offsety);
+            if(0 <= pos.x && pos.x < screenWidth && 0 <= pos.y && pos.y < screenHeight){
+                sum += dot(screen[pos], agent.speciesMask * 2.0f - 1.0f);
+                //screen[pos] = float4(0.0f, 1.0f, 0.0f, 1.0f);
+            }
+        }
+    }
+    return sum;
+}
+
+[numthreads(100, 1, 1)]
+void agentsSensorKernel (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x < (uint)0 || (uint)numAgents <= id.x) return;
+
+    float weightForward = sense(agents[id.x], 0.0f);
+    float weightLeft = sense(agents[id.x], 1.0f);
+    float weightRight = sense(agents[id.x], -1.0f);
+
+    float randomSteerAngle = nrand(id.x, id.x);
+    if(weightForward>weightLeft && weightForward> weightRight){
+        agents[id.x].angle += 0;
+    }
+    else if(weightForward< weightLeft && weightForward < weightRight){
+        agents[id.x].angle += (2.0f * randomSteerAngle - 1.0f) * agents[id.x].turnSpeed * deltaTime;
+    }
+    else if(weightLeft > weightRight){
+        agents[id.x].angle += randomSteerAngle * agents[id.x].turnSpeed * deltaTime;
+    }
+    else if(weightLeft < weightRight){
+        agents[id.x].angle -= randomSteerAngle * agents[id.x].turnSpeed * deltaTime;
+    }
+}
+
+[numthreads(100, 1, 1)]
+void agentsMoveKernel (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x < (uint)0 || (uint)numAgents <= id.x) return;
+
+    float2 direction = float2(cos(agents[id.x].angle), sin(agents[id.x].angle));
+    float2 newPos = agents[id.x].pos + direction * (agents[id.x].speed * deltaTime);
+
+    if(newPos.x < 0 || screenWidth <= newPos.x){
+        newPos.x = min(screenWidth - 1, max(0, newPos.x));
+        agents[id.x].angle = PI - agents[id.x].angle;
+    }
+    if(newPos.y < 0 || screenHeight <= newPos.y){
+        newPos.y = min(float(screenHeight) - 1.0f, max(0.0f, newPos.y));
+        agents[id.x].angle *= -1.0f;
+    }
+
+    agents[id.x].pos = newPos;
+    //screen[agents[id.x].pos] = agents[id.x].speciesMask;
+    //screen[agents[id.x].pos] = clamp(agents[id.x].speciesMask * agents[id.x].depositRate, 0.0f, 1.0f);
+    screen[agents[id.x].pos] = clamp(screen[agents[id.x].pos] + agents[id.x].speciesMask * agents[id.x].depositRate * deltaTime, 0.0f, 1.0f);
+    //screen[agents[id.x].pos] = screen[agents[id.x].pos] + agents[id.x].speciesMask * agents[id.x].depositRate * deltaTime;
+    
+}
+
+[numthreads(16, 16, 1)]
+void screenUpdateKernel (uint3 id : SV_DispatchThreadID)
+{
+    if(id.x < (uint)0 || (uint)screenWidth <= id.x || id.y < (uint)0 || (uint)screenHeight <= id.y ) return;
+    
+    float4 diffusionResult = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for(int offsetx = -blurOffset; offsetx <= blurOffset; offsetx++){
+        for(int offsety = -blurOffset; offsety <= blurOffset; offsety++){
+            int2 diffusionSample = id.xy + int2(offsetx,offsety);
+            if(0 <= diffusionSample.x && diffusionSample.x < screenWidth && 0 <= diffusionSample.y && diffusionSample.y < screenHeight){
+                diffusionResult += screen[diffusionSample];
+            }
+        }
+    }
+    diffusionResult /= ((2 * blurOffset + 1) * (2 * blurOffset + 1));
+
+    float4 diffusedColor = lerp(screen[id.xy], diffusionResult, diffuseSpeed * deltaTime);
+    float4 evaporatedColor = max(diffusedColor - evaporateSpeed * deltaTime, 0.0f);
+    screen[id.xy] = clamp(evaporatedColor, 0.0f, 1.0f);
+}
+
+[numthreads(16, 16, 1)]
+void screenClearKernel (uint3 id : SV_DispatchThreadID){
+    if(id.x < (uint)0 || (uint)screenWidth <= id.x || id.y < (uint)0 || (uint)screenHeight <= id.y ) return;
+    screen[id.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    //float r = random((id.x + id.y * screenWidth) * deltaTime);
+    //float r = nrand(id.xy * time);
+    //screen[id.xy] = float4(r, r, r, r);
+}
